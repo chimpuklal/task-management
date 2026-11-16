@@ -1,0 +1,14 @@
+# Environment variables and secrets
+.env
+.env.*
+
+# Go
+*.exe
+*.out
+*.test
+
+# IDE
+.vscode/
+
+# OS
+.DS_Store
