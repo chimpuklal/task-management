@@ -1,71 +1,122 @@
 package main
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strings"
-	"sync"
+	"time"
+
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 type user struct {
-	Name  string `json:"name"`
-	Email string `json:"email"`
+	ID        int64     `json:"id"`
+	Name      string    `json:"name"`
+	Email     string    `json:"email"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
-var users []user
-var usersMu sync.RWMutex
+func userHandler(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Your existing POST logic goes here.
 
-func userHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
 
+		}
+		var newUser user
+		err := json.NewDecoder(r.Body).Decode(&newUser)
+		if err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+		if strings.TrimSpace(newUser.Name) == "" ||
+			strings.TrimSpace(newUser.Email) == "" {
+			http.Error(w, "name and email are required", http.StatusBadRequest)
+			return
+		}
+
+		query := `
+            INSERT INTO users (name, email)
+            VALUES ($1, $2)
+            RETURNING id, created_at
+        `
+
+		err = db.QueryRowContext(
+			r.Context(),
+			query,
+			newUser.Name,
+			newUser.Email,
+		).Scan(&newUser.ID, &newUser.CreatedAt)
+
+		if err != nil {
+			log.Printf("failed to create user: %v", err)
+			http.Error(w, "could not create user", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+
+		if err := json.NewEncoder(w).Encode(newUser); err != nil {
+			log.Printf("failed to encode response: %v", err)
+		}
 	}
-	var newUser user
-	err := json.NewDecoder(r.Body).Decode(&newUser)
-	if err != nil {
-		http.Error(w, "invalid JSON", http.StatusBadRequest)
-		return
-	}
-	if strings.TrimSpace(newUser.Name) == "" ||
-		strings.TrimSpace(newUser.Email) == "" {
-		http.Error(w, "name and email are required", http.StatusBadRequest)
-		return
-	}
-
-	usersMu.Lock()
-	users = append(users, newUser)
-	usersMu.Unlock()
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-
-	if err := json.NewEncoder(w).Encode(newUser); err != nil {
-		log.Printf("failed to encode response: %v", err)
-	}
-
 }
-func listUsersHandler(w http.ResponseWriter, r *http.Request) {
+func listUsersHandler(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 
-	if r.Method != http.MethodGet {
-		w.Header().Set("Allow", http.MethodGet)
-		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
-		return
+		rows, err := db.QueryContext(
+			r.Context(),
+			"SELECT id, name, email, created_at FROM users ORDER BY id",
+		)
 
-	}
+		if err != nil {
+			log.Printf("failed to fetch users: %v", err)
+			http.Error(w, "could not fetch users", http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
 
-	usersMu.RLock()
-	usersList := make([]user, len(users))
-	copy(usersList, users)
-	usersMu.RUnlock()
+		usersList := make([]user, 0)
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
+		for rows.Next() {
+			var u user
 
-	if err := json.NewEncoder(w).Encode(usersList); err != nil {
-		log.Printf("failed to encode response: %v", err)
+			err := rows.Scan(&u.ID, &u.Name, &u.Email, &u.CreatedAt)
+			if err != nil {
+				log.Printf("failed to scan user: %v", err)
+				http.Error(w, "could not read users", http.StatusInternalServerError)
+				return
+			}
+
+			usersList = append(usersList, u)
+		}
+
+		if err := rows.Err(); err != nil {
+			log.Printf("error iterating users: %v", err)
+			http.Error(w, "could not read users", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+
+		if err := json.NewEncoder(w).Encode(usersList); err != nil {
+			log.Printf("failed to encode response: %v", err)
+		}
 	}
 }
 
@@ -95,13 +146,52 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func connectDB() (*sql.DB, error) {
+	// Read the database URL from the environment.
+	dsn := os.Getenv("DATABASE_URL")
+
+	if dsn == "" {
+		return nil, fmt.Errorf("DATABASE_URL is not set")
+	}
+
+	// Create a database handle using the pgx driver.
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open database: %w", err)
+	}
+
+	// Verify that PostgreSQL is actually reachable.
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		5*time.Second,
+	)
+	defer cancel()
+
+	if err := db.PingContext(ctx); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to connect to PostgreSQL: %w", err)
+	}
+
+	return db, nil
+}
+
 func main() {
+
+	db, err := connectDB()
+
+	if err != nil {
+		log.Fatalf("Database connection failed: %v", err)
+	}
+
+	defer db.Close()
+
+	log.Println("Successfully connected to PostgreSQL")
 
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /health", healthHandler)
-	mux.HandleFunc("POST /users", userHandler)
-	mux.HandleFunc("GET /users", listUsersHandler)
+	mux.HandleFunc("POST /users", userHandler(db))
+	mux.HandleFunc("GET /users", listUsersHandler(db))
 
 	addr := ":8081"
 
